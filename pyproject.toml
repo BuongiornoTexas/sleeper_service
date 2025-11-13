@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "sleeperservice"
+name = "sleeper_service"
 version = "v0.0.1"
 authors = [
   {name="BuongiornoTexas"},
@@ -21,5 +21,5 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/BuongiornoTexas/sleeperservice"
-"Bug Tracker" = "https://github.com/BuongiornoTexas/sleeperservice/issues"
+"Homepage" = "https://github.com/BuongiornoTexas/sleeper_service"
+"Bug Tracker" = "https://github.com/BuongiornoTexas/sleeper_service/issues"
