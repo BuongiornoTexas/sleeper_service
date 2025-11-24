@@ -17,7 +17,9 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "pywin32"
+    "pywin32",
+    "tomli-w",
+    "pydantic-settings"
 ]
 
 [project.urls]

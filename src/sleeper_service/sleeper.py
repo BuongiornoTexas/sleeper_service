@@ -2,6 +2,7 @@
 # Note - need to add "--extension-pkg-allow-list=win32security, win32api" to pylint
 # settings to avoid setting off unsafe ctypes warning.
 # cspell:ignore pywintypes, typeshed, superceded, WINFUNCTYPE, powrprof, LASTINPUTINFO
+# cspell:ignore dotenv
 """Implements a simple sleep forcing mechanic for Windows.
 
 Functions
@@ -9,15 +10,72 @@ Functions
 """
 from time import sleep
 from datetime import datetime
-from typing import Callable
+from typing import Any, Callable
 import ctypes
 from ctypes import wintypes
+from pathlib import Path
+import threading
+from pydantic import PrivateAttr
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    TomlConfigSettingsSource,
+)
+from tomli_w import dump as dump_toml
 import win32api
 import win32security
 
-# Periods in seconds.
-SLEEP_AFTER = 3 * 60
-CHECK_INTERVAL = 15
+M_TO_SECONDS = 60
+# To save pain, this will always for config.
+TOML_PATH = Path.home() / "AppData/Local/sleeper_service/config.toml"
+
+
+class Settings(BaseSettings):
+    """Rough and ready settings via pydantic."""
+
+    # When using system settings, sleep/hibernate time is pulled from powercfg
+    use_system_timer: bool = True
+    # Manual timer if not using system timer
+    manual_sleep_after: int = 10  # minutes
+    check_interval: int = 1  # minutes
+    _lock: threading.Lock = PrivateAttr()
+    _update_flag: threading.Event = PrivateAttr()
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Customise settings to use toml file only."""
+        return (TomlConfigSettingsSource(settings_cls),)
+
+    def model_post_init(self, context: Any, /) -> None:
+        """Resave settings, created threading objects."""
+        self.save()
+        self._lock = threading.Lock()
+        self._update_flag = threading.Event()
+
+    def save(self) -> None:
+        """Write settings to the default location."""
+        if not TOML_PATH.parent.exists():
+            TOML_PATH.parent.mkdir()
+
+        with open(TOML_PATH, "wb") as fp:
+            dump_toml(self.model_dump(), fp)
+
+    @property
+    def lock(self) -> threading.Lock:
+        """Provide lock object for context manager."""
+        return self._lock
+
+    @property
+    def update_flag(self) -> threading.Event:
+        """Provide settings update flag for thread notification."""
+        return self._update_flag
 
 
 class LASTINPUTINFO(ctypes.Structure):
@@ -41,8 +99,15 @@ class LASTINPUTINFO(ctypes.Structure):
 class SleeperService:
     """Monitors idle timer, forces sleep in line with power settings."""
 
-    _hibernate: bool
+    # Settings, shared across threads.
+    _settings: Settings
     _sleep_after: int
+    _check_interval: int
+
+    # This group may disappear later.
+    _hibernate: bool
+
+    # pywin32 stuff.
     _last_input_info: LASTINPUTINFO
     # Class callables
     _callables_defined: bool = False
@@ -50,13 +115,15 @@ class SleeperService:
     _get_tick_count: Callable
     _get_last_input_info: Callable
 
-    def __init__(self) -> None:
+    def __init__(self, settings: Settings) -> None:
         """Create api methods used in class."""
+        self._settings = settings
+        self.reload_settings()
+
         # Pending setup:
         #   - Read registry to get Hibernate vs sleep state, and time to to sleep.
         # For now, force to false, use SLEEP_AFTER constant.
         self._hibernate = False
-        self._sleep_after = SLEEP_AFTER
         if not self._callables_defined:
             self._create_api_methods()
 
@@ -66,6 +133,18 @@ class SleeperService:
         # cb_size should be defined in LASTINPUTINFO(), but it's beyond my skills.
         # pylint: disable-next=[attribute-defined-outside-init]
         self._last_input_info.cb_size = ctypes.sizeof(self._last_input_info)
+
+    def reload_settings(self) -> None:
+        """Read and process settings (thread safe)."""
+        with self._settings.lock:
+            if self._settings.use_system_timer:
+                pass
+            else:
+                self._sleep_after = self._settings.manual_sleep_after * M_TO_SECONDS
+
+            self._check_interval = self._settings.check_interval * M_TO_SECONDS
+
+            self._settings.update_flag.clear()
 
     @classmethod
     def _create_api_methods(cls) -> None:
@@ -96,9 +175,7 @@ class SleeperService:
 
         prototype = ctypes.WINFUNCTYPE(wintypes.BOOL, ctypes.POINTER(LASTINPUTINFO))
         # See idle_time for error handling.
-        cls._get_last_input_info = prototype(
-            ("GetLastInputInfo", ctypes.windll.user32)
-        )
+        cls._get_last_input_info = prototype(("GetLastInputInfo", ctypes.windll.user32))
 
         cls._callables_defined = True
 
@@ -171,7 +248,7 @@ class SleeperService:
         # This is the main loop that should be run as separate thread?
 
         while True:
-            sleep(CHECK_INTERVAL)
+            sleep(self._check_interval)
             idle = self.idle_time()
             if idle > self._sleep_after:
                 print(f"Sleeping at: {datetime.now()}")
@@ -183,6 +260,11 @@ class SleeperService:
 
 
 if __name__ == "__main__":
+    # Shared settings.
+    my_settings = Settings()
+    my_settings.use_system_timer = False
+    my_settings.manual_sleep_after = 2
+    my_settings.check_interval = 0.25
 
-    sleeper = SleeperService()
+    sleeper = SleeperService(my_settings)
     sleeper.main_loop()

@@ -5,9 +5,11 @@
 # TODO
 
 Implementation:
-- Bare bones timer to force sleep.
+- <del>Bare bones timer to force sleep.</del>
 - Update module docs as I go.
-- Lock down pypi package name. 
+- <del>Lock down pypi package name. </del>
+- <del>Create pydantic-settings model for settings<del>
+- <del>Initial thread elements<del>
 - Extract "Sleep after" parameter value from active power plan.
 - Add option too keep awake if audio stream detected on specific devices.
 - Add pystray system tray icon.
@@ -16,6 +18,8 @@ Implementation:
 Notes:
 - To enable/disable hibernate: admin shell->powercfg /hibernate on/off
 - To test hibernate status: admin shell->powercfg /a
+- Look into using pycaw to enable/disable microphones/inputs as a way to kill 
+sleep blocking by powercfg requests.
 
 
 # sleeper_service
