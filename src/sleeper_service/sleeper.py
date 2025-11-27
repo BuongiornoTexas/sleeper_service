@@ -2,7 +2,7 @@
 # Note - need to add "--extension-pkg-allow-list=win32security, win32api" to pylint
 # settings to avoid setting off unsafe ctypes warning.
 # cspell:ignore pywintypes, typeshed, superceded, WINFUNCTYPE, powrprof, LASTINPUTINFO
-# cspell:ignore dotenv
+# cspell:ignore dotenv, _MEIPASS
 """Implements a simple sleep forcing mechanic for Windows.
 
 Functions
@@ -14,6 +14,7 @@ from typing import Any, Callable
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
+import sys
 import threading
 from pydantic import PrivateAttr
 from pydantic_settings import (
@@ -26,8 +27,10 @@ import win32api
 import win32security
 
 M_TO_SECONDS = 60
-# To save pain, this will always for config.
-TOML_PATH = Path.home() / "AppData/Local/sleeper_service/config.toml"
+# Per https://github.com/pydantic/pydantic-settings/issues/259, use a global
+# hack to allow cli config file location.
+CONFIG_FILE_PATH: Path | None = None
+CONFIG_FILE = "config.toml"
 
 
 class Settings(BaseSettings):
@@ -38,6 +41,7 @@ class Settings(BaseSettings):
     # Manual timer if not using system timer
     manual_sleep_after: int = 10  # minutes
     check_interval: int = 1  # minutes
+    _config_path: Path | None = None
     _lock: threading.Lock = PrivateAttr()
     _update_flag: threading.Event = PrivateAttr()
 
@@ -51,20 +55,34 @@ class Settings(BaseSettings):
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         """Customise settings to use toml file only."""
-        return (TomlConfigSettingsSource(settings_cls),)
+        global CONFIG_FILE_PATH  # pylint: disable=W0603
+        if not CONFIG_FILE_PATH:
+            # Use the same location as the source file per pyinstaller docs for
+            # one folder app.
+            if getattr(sys, 'frozen', False):
+                # we are running in a bundle
+                # pylint: disable-next=protected-access
+                config_folder = Path(sys._MEIPASS)  # type:ignore[attr-defined]
+            else:
+                # we are running in a normal Python environment
+                config_folder = Path(__file__).resolve().parent
+
+            # Fix the global constant.
+            CONFIG_FILE_PATH = config_folder / CONFIG_FILE
+
+        return (TomlConfigSettingsSource(settings_cls, toml_file=CONFIG_FILE_PATH), )
 
     def model_post_init(self, context: Any, /) -> None:
         """Resave settings, created threading objects."""
-        self.save()
         self._lock = threading.Lock()
         self._update_flag = threading.Event()
+        self.save()
 
     def save(self) -> None:
         """Write settings to the default location."""
-        if not TOML_PATH.parent.exists():
-            TOML_PATH.parent.mkdir()
-
-        with open(TOML_PATH, "wb") as fp:
+        # Assertion should never be triggered.
+        assert CONFIG_FILE_PATH is not None
+        with open(CONFIG_FILE_PATH, "wb") as fp:
             dump_toml(self.model_dump(), fp)
 
     @property

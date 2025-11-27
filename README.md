@@ -10,6 +10,7 @@ Implementation:
 - <del>Lock down pypi package name. </del>
 - <del>Create pydantic-settings model for settings<del>
 - <del>Initial thread elements<del>
+- Test that file location works correctly with pyinstaller bundle, cli option.
 - Extract "Sleep after" parameter value from active power plan.
 - Add option too keep awake if audio stream detected on specific devices.
 - Add pystray system tray icon.
@@ -19,7 +20,9 @@ Notes:
 - To enable/disable hibernate: admin shell->powercfg /hibernate on/off
 - To test hibernate status: admin shell->powercfg /a
 - Look into using pycaw to enable/disable microphones/inputs as a way to kill 
-sleep blocking by powercfg requests.
+sleep blocking by powercfg requests. Specifically, using privacy & security setting for
+microphone. Maybe disabling device works as well. Neither sound like good solutions
+though.
 
 
 # sleeper_service
