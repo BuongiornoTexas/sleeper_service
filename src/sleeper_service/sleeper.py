@@ -2,18 +2,20 @@
 # Note - need to add "--extension-pkg-allow-list=win32security, win32api" to pylint
 # settings to avoid setting off unsafe ctypes warning.
 # cspell:ignore pywintypes, typeshed, superceded, WINFUNCTYPE, powrprof, LASTINPUTINFO
-# cspell:ignore dotenv, _MEIPASS
-"""Implements a simple sleep forcing mechanic for Windows.
+# cspell:ignore dotenv, _MEIPASS, SYSTEMPOWERSTATUS, STANDBYIDLE, HIBERNATEIDLE
+"""Implements a simple suspend (sleep/hibernate) forcing mechanic for Windows.
 
 Functions
 - Minimal class that monitors idle time and sleeps or hibernates after SLEEP_AFTER.
 """
+from enum import StrEnum, Enum
 from time import sleep
 from datetime import datetime
 from typing import Any, Callable
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
+from subprocess import run as run_sub
 import sys
 import threading
 from pydantic import PrivateAttr
@@ -33,13 +35,32 @@ CONFIG_FILE_PATH: Path | None = None
 CONFIG_FILE = "config.toml"
 
 
+class SuspendState(StrEnum):
+    """Suspend states."""
+
+    # Using strenum as toml can handle this.
+    SLEEP = "sleep"
+    HIBERNATE = "hibernate"
+    # And for suspending suspend states, or when neither are available.
+    DISABLED = "disabled"
+
+
+class PowerStatus(Enum):
+    """Power state for system."""
+
+    BATTERY = 0
+    AC_MODE = 1
+    UNKNOWN = 255
+
+
 class Settings(BaseSettings):
     """Rough and ready settings via pydantic."""
 
     # When using system settings, sleep/hibernate time is pulled from powercfg
     use_system_timer: bool = True
     # Manual timer if not using system timer
-    manual_sleep_after: int = 10  # minutes
+    manual_suspend_after: int = 10  # minutes
+    manual_suspend_state: SuspendState = SuspendState.SLEEP
     check_interval: int = 1  # minutes
     _config_path: Path | None = None
     _lock: threading.Lock = PrivateAttr()
@@ -59,7 +80,7 @@ class Settings(BaseSettings):
         if not CONFIG_FILE_PATH:
             # Use the same location as the source file per pyinstaller docs for
             # one folder app.
-            if getattr(sys, 'frozen', False):
+            if getattr(sys, "frozen", False):
                 # we are running in a bundle
                 # pylint: disable-next=protected-access
                 config_folder = Path(sys._MEIPASS)  # type:ignore[attr-defined]
@@ -70,7 +91,8 @@ class Settings(BaseSettings):
             # Fix the global constant.
             CONFIG_FILE_PATH = config_folder / CONFIG_FILE
 
-        return (TomlConfigSettingsSource(settings_cls, toml_file=CONFIG_FILE_PATH), )
+        # Only toml settings allowed.
+        return (TomlConfigSettingsSource(settings_cls, toml_file=CONFIG_FILE_PATH),)
 
     def model_post_init(self, context: Any, /) -> None:
         """Resave settings, created threading objects."""
@@ -114,16 +136,32 @@ class LASTINPUTINFO(ctypes.Structure):
     )
 
 
+class SYSTEMPOWERSTATUS(ctypes.Structure):
+    """Structure for return from GetSystemPowerStatus (SYSTEM_POWER_STATUS)."""
+
+    # From
+    # https://stackoverflow.com/questions/21083518/get-battery-status-using-wmi-in-python
+    # and
+    # https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getsystempowerstatus
+    _fields_ = [
+        ("ACLineStatus", wintypes.BYTE),
+        ("BatteryFlag", wintypes.BYTE),
+        ("BatteryLifePercent", wintypes.BYTE),
+        ("Reserved1", wintypes.BYTE),
+        ("BatteryLifeTime", wintypes.DWORD),
+        ("BatteryFullLifeTime", wintypes.DWORD),
+    ]
+
+
 class SleeperService:
-    """Monitors idle timer, forces sleep in line with power settings."""
+    """Monitors idle timer, forces suspend in line with active settings."""
 
     # Settings, shared across threads.
     _settings: Settings
-    _sleep_after: int
+    # Active suspend parameter set.
+    _suspend_after: int
     _check_interval: int
-
-    # This group may disappear later.
-    _hibernate: bool
+    _suspend_state: SuspendState
 
     # pywin32 stuff.
     _last_input_info: LASTINPUTINFO
@@ -132,16 +170,10 @@ class SleeperService:
     _set_suspend_state: Callable
     _get_tick_count: Callable
     _get_last_input_info: Callable
+    _get_system_power_status: Callable
 
     def __init__(self, settings: Settings) -> None:
         """Create api methods used in class."""
-        self._settings = settings
-        self.reload_settings()
-
-        # Pending setup:
-        #   - Read registry to get Hibernate vs sleep state, and time to to sleep.
-        # For now, force to false, use SLEEP_AFTER constant.
-        self._hibernate = False
         if not self._callables_defined:
             self._create_api_methods()
 
@@ -152,17 +184,109 @@ class SleeperService:
         # pylint: disable-next=[attribute-defined-outside-init]
         self._last_input_info.cb_size = ctypes.sizeof(self._last_input_info)
 
-    def reload_settings(self) -> None:
+        # With that done, we can process the settings.
+        self._settings = settings
+        self._reload_settings()
+
+    def _reload_settings(self) -> None:
         """Read and process settings (thread safe)."""
         with self._settings.lock:
             if self._settings.use_system_timer:
-                pass
+                self._get_system_settings()
             else:
-                self._sleep_after = self._settings.manual_sleep_after * M_TO_SECONDS
+                # In manual mode, we assume the user knows what they are doing. No
+                # checks. At all.
+                self._suspend_after = self._settings.manual_suspend_after * M_TO_SECONDS
+                self._suspend_state = self._settings.manual_suspend_state
 
             self._check_interval = self._settings.check_interval * M_TO_SECONDS
 
+            # Acknowledge settings update.
             self._settings.update_flag.clear()
+
+    def _get_system_settings(self) -> None:
+        """Parse powercfg info to establish system timer settings."""
+        # Default to not suspending with an hour long timer.
+        self._suspend_state = SuspendState.DISABLED
+        self._suspend_after = 60 * M_TO_SECONDS
+
+        # Will need AC/battery info. Don't use this often, so call on the fly.
+        power_status = SYSTEMPOWERSTATUS()
+        self._get_system_power_status(ctypes.byref(power_status))
+        power_state = PowerStatus(power_status.ACLineStatus)
+
+        # Figure out which suspend states takes precedence.
+        suspend_after = self._get_idle_times(power_state, SuspendState.SLEEP)
+        if suspend_after > 0:
+            # Set sleep parameters.
+            self._suspend_after = suspend_after
+            self._suspend_state = SuspendState.SLEEP
+
+        if self._hibernate_enabled:
+            suspend_after = self._get_idle_times(power_state, SuspendState.HIBERNATE)
+            if suspend_after > 0:
+                if (
+                    self._suspend_state == SuspendState.DISABLED
+                    or suspend_after < self._suspend_after
+                ):
+                    # Either sleep is not active, or hibernate time is more conservative
+                    self._suspend_after = suspend_after
+                    self._suspend_state = SuspendState.HIBERNATE
+
+    @staticmethod
+    def _get_idle_times(power_state: PowerStatus, idle_type: SuspendState) -> int:
+        """Use powercfg to get active sleep after/hibernate after value."""
+        if idle_type == SuspendState.SLEEP:
+            alias = "STANDBYIDLE"
+        elif idle_type == SuspendState.HIBERNATE:
+            alias = "HIBERNATEIDLE"
+        else:
+            raise ValueError(f"Invalid idle type '{idle_type}'.")
+
+        output = run_sub(
+            "powercfg /query SCHEME_CURRENT SUB_SLEEP " + alias,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.splitlines()
+
+        for line in output:
+            if "Power Setting Index: " in line:
+                parts = line.strip().split(" ")
+                if parts[1] == "AC":
+                    ac_value = int(parts[-1], 16)
+                else:
+                    dc_value = int(parts[-1], 16)
+                    break
+
+        if power_state == PowerStatus.AC_MODE:
+            active_value = ac_value
+        elif power_state == PowerStatus.BATTERY:
+            active_value = dc_value
+        else:
+            # Use the most conservative if in an unknown power state.
+            active_value = min(dc_value, ac_value)
+            if active_value == 0:
+                # Annoyingly, 0 is never, so:
+                active_value = max(dc_value, ac_value)
+
+        return active_value
+
+    @property
+    def _hibernate_enabled(self) -> bool:
+        """Check if hibernate is usable."""
+        output = run_sub(
+            "powercfg /a", check=True, text=True, capture_output=True
+        ).stdout.splitlines()
+
+        for line in output:
+            clean = line.strip()
+            if clean.startswith("The following sleep states are not available"):
+                # If we haven't found it, we aren't going to.
+                break
+            if clean == "Hibernate":
+                return True
+        return False
 
     @classmethod
     def _create_api_methods(cls) -> None:
@@ -195,9 +319,15 @@ class SleeperService:
         # See idle_time for error handling.
         cls._get_last_input_info = prototype(("GetLastInputInfo", ctypes.windll.user32))
 
+        # GetSystemPowerStatus needed for AC/DC operating state.
+        prototype = ctypes.WINFUNCTYPE(wintypes.BOOL, ctypes.POINTER(SYSTEMPOWERSTATUS))
+        cls._get_system_power_status = prototype(
+            ("GetSystemPowerStatus", ctypes.windll.kernel32)
+        )
+
         cls._callables_defined = True
 
-    def suspend(self, hibernate: bool = False) -> None:
+    def suspend(self) -> None:
         """Force sleep or hibernate for Windows.
 
         Parameters
@@ -211,6 +341,16 @@ class SleeperService:
         --------
         >>> suspend()
         """
+        # Preliminaries:
+        if self._suspend_state == SuspendState.DISABLED:
+            # no-op if suspend is disabled.
+            return
+
+        if self._suspend_state == SuspendState.HIBERNATE:
+            hibernate = True
+        else:
+            hibernate = False
+
         # Initially based on code from
         # https://stackoverflow.com/questions/7517496/sleep-suspend-hibernate-windows-pc.
         # However, that code uses win32api.SetSystemPowerState, which is superceded by
@@ -268,10 +408,10 @@ class SleeperService:
         while True:
             sleep(self._check_interval)
             idle = self.idle_time()
-            if idle > self._sleep_after:
-                print(f"Sleeping at: {datetime.now()}")
+            if idle > self._suspend_after:
+                print(f"Calling suspend at: {datetime.now()}")
                 # If suspend fails, we'll just try again next cycle.
-                self.suspend(self._hibernate)
+                self.suspend()
                 print(f"Waking at: {datetime.now()}")
             else:
                 print(f"Idle for {idle} seconds.")
@@ -280,8 +420,7 @@ class SleeperService:
 if __name__ == "__main__":
     # Shared settings.
     my_settings = Settings()
-    my_settings.use_system_timer = False
-    my_settings.manual_sleep_after = 2
+    # Hack for testing
     my_settings.check_interval = 0.25
 
     sleeper = SleeperService(my_settings)
