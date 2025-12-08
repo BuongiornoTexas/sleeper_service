@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sleeper_service"
-version = "v0.0.2"
+version = "v0.9.0"
 authors = [
   {name="BuongiornoTexas"},
 ]
@@ -19,7 +19,8 @@ classifiers = [
 dependencies = [
     "pywin32",
     "tomli-w",
-    "pydantic-settings"
+    "pydantic-settings",
+    "tray-manager"
 ]
 
 [project.urls]
