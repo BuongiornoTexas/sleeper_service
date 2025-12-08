@@ -3,6 +3,7 @@
 # settings to avoid setting off unsafe ctypes warning.
 # cspell:ignore pywintypes, typeshed, superceded, WINFUNCTYPE, powrprof, LASTINPUTINFO
 # cspell:ignore dotenv, _MEIPASS, SYSTEMPOWERSTATUS, STANDBYIDLE, HIBERNATEIDLE
+# cspell:ignore Wavelink, Elgato
 """Implements a simple suspend (sleep/hibernate) forcing mechanic for Windows.
 
 Functions
@@ -11,7 +12,6 @@ Functions
 from argparse import ArgumentParser
 import ctypes
 from ctypes import wintypes
-from datetime import datetime
 from enum import StrEnum, Enum
 from pathlib import Path
 from subprocess import run as run_sub
@@ -525,14 +525,30 @@ class SleeperService:
 
         while self._check_state():
             sleep(self._check_interval)
-            idle = self.idle_time()
-            if idle > self._suspend_after:
-                print(f"Calling suspend at: {datetime.now()}")
-                # If suspend fails, we'll just try again next cycle.
-                self.suspend()
-                print(f"Waking at: {datetime.now()}")
-            else:
-                print(f"Idle for {idle} seconds.")
+            if (
+                self._settings.enabled and
+                not self._suspend_state == SuspendState.DISABLED
+            ):
+                # Perform idle checks when the service is enabled and we have an
+                # active suspend state. Otherwise keep going.
+                idle = self.idle_time()
+                if idle > self._suspend_after:
+                    # If suspend fails, we'll just try again next cycle.
+                    self.suspend()
+
+                    ###############################
+                    # This is where we need to do things like restart programs/apps
+                    # after resuming from suspend. E.g.
+                    # subprocess.Popen("Elgato.Wavelink.exe")
+                    # If I go down this path, need to add a list of processes to
+                    # settings and canned actions that will be applied to these.
+                    # E.g.
+                    # [resume]
+                    # "Elgato.Wavelink.exe", "Popen"
+                    # "Process 2", "Run"
+                    # Do a look up here to decide how to handle each of these wake up
+                    # calls.
+                    ##############################################################
 
 
 if __name__ == "__main__":

@@ -12,11 +12,15 @@ For a long rant on why this exists, see the [Package Rationale](#package-rationa
 
 For the short version of why this exists, if you are looking for something/anything
 that deals with the "Legacy Kernel Caller" blocking sleep problem, hopefully this will
-work for you.
+work for you. In particular, if you have issues with Elgato Wave Link killing sleep, 
+this is intended to help.
 
-I'm implementing this in my spare time (hopefully only a couple of weeks to get up), so
-if you are interested, I suggest watch the repository for releases only and you'll be
-notified when the first version is available. 
+The v0.9 release provides a tray utility to trigger sleep or hibernate.
+
+Wave Link 3.0 is currently in beta and there are some people (myself included) who are
+having problems with Wave Link 3.0 resuming from sleep properly. I'm hoping that Elgato
+will address this in the beta, but if not, I have a possible work around that I will
+implement post 3.0 full release.
 
 # Change Log
 
@@ -156,20 +160,9 @@ bundle.
 
 Implementation:
 - Update module docs as development progresses.
-- Sort out active/inactive icons.
 - Maybe add option too keep awake if audio stream detected on specific devices.
-- Delete note about watching for first release.
-- Delete note about developing in spare time. 
-- Delete testing hacks in main
-- Delete print() statements
+- Sort out active/inactive icons.
 - Kill the console and convert to .pyw app.
-- <del>Add pystray system tray icon.</del>
-- <del>Document settings available from system tray.</del>
-- <del>Update config.toml notes to emphasise most settings are only changeable in the 
-settings file.</del>
-- <del>setup .toml file location.</del>
-- <del>Implement cli arguments (probably only settings file location?).</del>
-- <del>Test that file location works correctly with pyinstaller bundle, cli option.</del>
 
 Right now, wave link breaks things badly on resume from sleep. If Elgato don't fix
 this, each time we resume, we may need to:
