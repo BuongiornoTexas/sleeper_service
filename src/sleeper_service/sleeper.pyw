@@ -3,7 +3,7 @@
 # settings to avoid setting off unsafe ctypes warning.
 # cspell:ignore pywintypes, typeshed, superceded, WINFUNCTYPE, powrprof, LASTINPUTINFO
 # cspell:ignore dotenv, _MEIPASS, SYSTEMPOWERSTATUS, STANDBYIDLE, HIBERNATEIDLE
-# cspell:ignore Wavelink, Elgato
+# cspell:ignore Wavelink, Elgato, Segoeui, creationflags
 """Implements a simple suspend (sleep/hibernate) forcing mechanic for Windows.
 
 Functions
@@ -14,11 +14,12 @@ import ctypes
 from ctypes import wintypes
 from enum import StrEnum, Enum
 from pathlib import Path
-from subprocess import run as run_sub
+from subprocess import run as run_sub, Popen, CREATE_NO_WINDOW
 import sys
 from time import sleep
 import threading
 from typing import Any, Callable
+from PIL import Image, ImageDraw, ImageFont
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -42,6 +43,7 @@ CONFIG_FILE = "config.toml"
 
 # Strings for tray menu items
 ENABLED = "Enabled"
+DISABLED = "Disabled"
 USE_SYSTEM_TIMERS = "Use System Timers"
 SUSPEND_STATE = "Suspend state"
 SUSPEND_AFTER = "Suspend after"
@@ -58,12 +60,54 @@ class SuspendState(StrEnum):
     DISABLED = "disabled"
 
 
+####################################################
+# BETA Functionality. May remove this in future.
+class RestartType(StrEnum):
+    """Process restart types.
+
+    Beta functionality. Supports limited restarting of processes following a resume.
+    """
+
+    # For now, only supporting a basic subprocess.Popen call.
+    POPEN = "Popen"
+####################################################
+
+
 class PowerStatus(Enum):
     """Power state for system."""
 
     BATTERY = 0
     AC_MODE = 1
     UNKNOWN = 255
+
+
+def tray_icons() -> tuple[Image.Image, Image.Image]:
+    """Return minimal enabled/disabled icons for sleeper_service."""
+    # I'd prefer to make the background transparent, but white will have to do to
+    # make things safe for light and dark interfaces.
+    # (An alpha of zero would be better!
+    # image = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+    disabled = Image.new("RGB", (64, 64), "white")
+    draw = ImageDraw.Draw(disabled)
+
+    # Ugly trial and error
+    font_size = 60
+    font = ImageFont.truetype("C:/Windows/fonts/Segoeui.ttf", font_size)
+    draw.text((15, 11), "Z", font=font, fill="black", stroke_width=0, anchor="lt")
+
+    font_size = 24
+    font = ImageFont.truetype("C:/Windows/fonts/Segoeui.ttf", font_size)
+    draw.text((5, 20), "Z", font=font, fill="black", stroke_width=0, anchor="lt")
+    font_size = 16
+    font = ImageFont.truetype("C:/Windows/fonts/Segoeui.ttf", font_size)
+    draw.text((45, 30), "Z", font=font, fill="black", stroke_width=0, anchor="lt")
+
+    enabled = disabled.copy()
+
+    draw.line((5, 5, 59, 59), "red", 3)
+    draw.line((5, 59, 59, 5), "red", 3)
+
+    return (enabled, disabled)
 
 
 class Settings(BaseSettings):
@@ -77,6 +121,10 @@ class Settings(BaseSettings):
     manual_suspend_after: int | float = 10  # minutes
     manual_suspend_state: SuspendState = SuspendState.SLEEP
     check_interval: int | float = 1  # minutes
+    ####################################################
+    # BETA Functionality. May remove this in future.
+    restarts: dict[str, RestartType] = {}
+    ####################################################
     _config_path: Path | None = None
 
     @classmethod
@@ -245,6 +293,11 @@ class SleeperService:
 
         self._tray = TrayManager("Sleeper Service", run_in_separate_thread=True)
 
+        icons = tray_icons()
+        self._tray.load_icon(icons[0], ENABLED)
+        self._tray.load_icon(icons[1], DISABLED)
+        self._update_icon()
+
         # Adding the menu from the main thread. Which is thread safe
         # as nothing happens until the menu is active anyway
         menu = self._tray.menu
@@ -254,6 +307,13 @@ class SleeperService:
         # Finally, trigger an update when the main loop starts.
         self._state_change.set()
 
+    def _update_icon(self) -> None:
+        """Set icon to match enabled state."""
+        if self._shared_enabled_state:
+            self._tray.set_icon(ENABLED)
+        else:
+            self._tray.set_icon(DISABLED)
+
     def _update_state(self, tray_exit: bool = False) -> None:
         """Update states and update flag to notify sleeper service of state change."""
         with self._lock:
@@ -261,6 +321,7 @@ class SleeperService:
             # Service will manage settings update.
             # A tiny bit of doubling up.
             self._shared_enabled_state = self._menu_items[ENABLED].get_status()
+            self._update_icon()
             self._shared_use_system_state = self._menu_items[
                 USE_SYSTEM_TIMERS
             ].get_status()
@@ -341,6 +402,7 @@ class SleeperService:
             check=True,
             text=True,
             capture_output=True,
+            creationflags=CREATE_NO_WINDOW,
         ).stdout.splitlines()
 
         for line in output:
@@ -369,7 +431,11 @@ class SleeperService:
     def _hibernate_enabled(self) -> bool:
         """Check if hibernate is usable."""
         output = run_sub(
-            "powercfg /a", check=True, text=True, capture_output=True
+            "powercfg /a",
+            check=True,
+            text=True,
+            capture_output=True,
+            creationflags=CREATE_NO_WINDOW,
         ).stdout.splitlines()
 
         for line in output:
@@ -511,11 +577,11 @@ class SleeperService:
                     # might as well exit now.
                     return False
 
-        # Clear the flag so the tray can work again and so we don't repeat.
-        self._state_change.clear()
+            # Clear the flag so the tray can work again and so we don't repeat.
+            self._state_change.clear()
 
-        # Apply changes to the service settings.
-        self._update_suspend_settings()
+            # Apply changes to the service settings.
+            self._update_suspend_settings()
 
         return True
 
@@ -526,8 +592,8 @@ class SleeperService:
         while self._check_state():
             sleep(self._check_interval)
             if (
-                self._settings.enabled and
-                not self._suspend_state == SuspendState.DISABLED
+                self._settings.enabled
+                and not self._suspend_state == SuspendState.DISABLED
             ):
                 # Perform idle checks when the service is enabled and we have an
                 # active suspend state. Otherwise keep going.
@@ -536,7 +602,8 @@ class SleeperService:
                     # If suspend fails, we'll just try again next cycle.
                     self.suspend()
 
-                    ###############################
+                    ####################################################
+                    # BETA Functionality. May remove this in future.
                     # This is where we need to do things like restart programs/apps
                     # after resuming from suspend. E.g.
                     # subprocess.Popen("Elgato.Wavelink.exe")
@@ -548,6 +615,11 @@ class SleeperService:
                     # "Process 2", "Run"
                     # Do a look up here to decide how to handle each of these wake up
                     # calls.
+                    # Not trying to be clever at all initially. Restart wavelink and
+                    # call it a day.
+                    for program, restart in self._settings.restarts.items():
+                        if restart == RestartType.POPEN:
+                            Popen(program)
                     ##############################################################
 
 

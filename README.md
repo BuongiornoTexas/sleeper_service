@@ -17,13 +17,68 @@ this is intended to help.
 
 The v0.9 release provides a tray utility to trigger sleep or hibernate.
 
-Wave Link 3.0 is currently in beta and there are some people (myself included) who are
-having problems with Wave Link 3.0 resuming from sleep properly. I'm hoping that Elgato
-will address this in the beta, but if not, I have a possible work around that I will
-implement post 3.0 full release.
+## Beta: App/program Launch on Resume
+
+**v0.10.0 Beta functionality** Use with caution. I have added a beta function that can
+(re-)launch apps/programs when resuming from a suspension *triggered by
+sleeper_service* (it does not work when sleep is triggered by the system or the start
+menu). This capability uses python's subprocess Popen to launch programs.
+
+I've added this functionality because it allows me to manage issues in the Elgato Wave
+Link 3.0 beta. Specifically there are some people (myself included) who are having
+problems with Wave Link resuming from sleep properly. In my case, Wave Link either
+crashes (most of the time), or breaks mixes and/or channel/mix connections. I'm
+hoping that Elgato will address this issue  as part of their beta.
+
+In the interim, I'm using this function to restart Wave Link each time I resume from
+sleep (my examples in this section are for Wave Link). This is  working well enough to
+allow me to use the beta. The one downside is that Wave Link will always open a
+foreground desktop window on resume, as the beta does not support opening minimised to
+the tray. I'm assuming this will be addressed towards the end of the beta. If not, I
+will tweak the restart functionality when the final version releases.
+
+To set it up, run sleeper_service to create/update the settings file, then exit, and
+edit the settings so that the `[restarts]` section of the `config.toml` file looks like: 
+```
+[restarts]
+"Elgato.Wavelink.exe" = "Popen"
+```
+In my case "Elgato.Wavelink.exe" is a system alias for starting the UWP Wave Link 3.0
+app. Please replace this with your app name. Currently, "Popen" is the only launch mode
+suppported, so this is the only valid value. Finally, if you want to start more than
+one app on resume, just add another line per app. 
+
+Using my sample `[restarts]`, Wave Link should restart after every resume triggered by *sleeper_service*. As noted previously, manual or other automatic resumes will not
+trigger this restart. 
+
+This functionality will work with program or app that:
+- Can be launched with Popen call.
+- Does not require admin privileges.
+- Returns immediately from the Popen call.
+
+This may be useful for other audio control apps that cause the "Legacy Kernel Caller"
+problem - e.g. Voicemeeter or SteelSeries Sonar (I haven't tested either of these, but
+I know it was an issue for older versions of Voicemeeter, and may still be?). If you do
+test this successfully with apps other than Wave Link, can you please add a comment
+to the end of this [issue](https://github.com/BuongiornoTexas/sleeper_service/issues/2)
+so that I can update the list of programs known to restart correctly.
+
+If you have a program that you can't get to work with `[restarts]`, please raise an 
+[issue](https://github.com/BuongiornoTexas/sleeper_service/issues/) so that we can
+address the problem.
+
+We do have a live issue which may affect some programs/apps - any program/app restarted
+after sleep will have the same Windows "Current Directory" as the sleeper_service. This
+could be a problem if it relies on finding configuration or data files in the current
+directory. I'm treating this as a lower priority enhancement for a future release. If
+this is affecting you, please add a comment on this 
+[issue](https://github.com/BuongiornoTexas/sleeper_service/issues/1) so that I know to
+make it a higher priority.
 
 # Change Log
 
+- **V0.10.0** Converted to .pyw app, added beta function to enable restarting Wave Link
+on resume from sleep.
 - **v0.9.0** Tray manager interface, core sleep functions implemented.
 - **v0.0.2** Functional beta. Still requires pystray wrapper. 
 - **v0.0.1** Proof of concept. 
@@ -153,20 +208,23 @@ sleep states).
 # PyInstaller Builds
 
 If you are building your own binary, I suggest starting with a clean environment and
-install only  sleeper_service and pyinstaller to minimise bycatch in the pyinstaller
+install only  sleeper_service and pyinstaller to minimise  by-catch in the pyinstaller
 bundle.
 
-# TODO
+# TODO/In Progress
+
+This section contains informal notes on pending implementation details and possible
+future fixes/extensions.
 
 Implementation:
 - Update module docs as development progresses.
 - Maybe add option too keep awake if audio stream detected on specific devices.
-- Sort out active/inactive icons.
-- Kill the console and convert to .pyw app.
+- Make/ask for help with better icon. Best described as a bit rubbish at the moment.
 
 Right now, wave link breaks things badly on resume from sleep. If Elgato don't fix
 this, each time we resume, we may need to:
-- (best case) restart wave link.
+- (best case) restart wave link. Currently in beta for the beta. Not ideal, as Wave Link
+does not restart minimised.
 - check if wave link is active, kill and restart.
 
 For finding and restarting Wave Link:
@@ -185,3 +243,5 @@ Other:
 sleep blocking by powercfg requests. Specifically, using privacy & security setting for
 microphone. Maybe disabling device works as well. Neither sound like good solutions
 though.
+- Assuming Elgato fix the resume problem, it may be enough to simply pause/play to reset
+audio. Or maybe trigger a Streamdeck call to enable/disable channel/mix connections?
