@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sleeper_service"
-version = "v0.9.0"
+version = "v0.10.0"
 authors = [
   {name="BuongiornoTexas"},
 ]
