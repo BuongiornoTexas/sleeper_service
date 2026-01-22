@@ -48,7 +48,8 @@ app. Please replace this with your app name. Currently, "Popen" is the only laun
 suppported, so this is the only valid value. Finally, if you want to start more than
 one app on resume, just add another line per app. 
 
-Using my sample `[restarts]`, Wave Link should restart after every resume triggered by *sleeper_service*. As noted previously, manual or other automatic resumes will not
+Using my sample `[restarts]`, Wave Link should restart after every resume triggered by
+*sleeper_service*. As noted previously, manual or other automatic resumes will not
 trigger this restart. 
 
 This functionality will work with program or app that:
@@ -77,6 +78,8 @@ make it a higher priority.
 
 # Change Log
 
+- **v0.11.0** Added an option to add a "Suspend now!" button to the tray menu for 
+testing. This can only be enabled by editing the `config.toml` settings.
 - **V0.10.0** Converted to .pyw app, added beta function to enable restarting Wave Link
 on resume from sleep.
 - **v0.9.0** Tray manager interface, core sleep functions implemented.
@@ -140,6 +143,8 @@ Allowable case sensitive values are: "sleep", "hibernate" or "disabled".
 - `check_interval`: time in minutes that sleeper_service will sleep between checks that
 the idle time has expired (I'm assuming most people will be happy checking once a
 minute at most).
+- `suspend_button`: when `true`, the tray menu includes a "Suspend now!" button that
+will immediately enable the suspend state. (Great for testing!)
 
 The default configuration file is:
 ```

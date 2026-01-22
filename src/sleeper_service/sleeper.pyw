@@ -47,6 +47,7 @@ DISABLED = "Disabled"
 USE_SYSTEM_TIMERS = "Use System Timers"
 SUSPEND_STATE = "Suspend state"
 SUSPEND_AFTER = "Suspend after"
+SUSPEND_NOW = "Suspend now!"
 EXIT = "Exit"
 
 
@@ -121,6 +122,7 @@ class Settings(BaseSettings):
     manual_suspend_after: int | float = 10  # minutes
     manual_suspend_state: SuspendState = SuspendState.SLEEP
     check_interval: int | float = 1  # minutes
+    suspend_button: bool = False
     ####################################################
     # BETA Functionality. May remove this in future.
     restarts: dict[str, RestartType] = {}
@@ -289,6 +291,9 @@ class SleeperService:
         )
         self._menu_items[SUSPEND_STATE] = Label(text="      Suspend: disabled")
         self._menu_items[SUSPEND_AFTER] = Label(text="      After: 0s")
+        if self._settings.suspend_button:
+            self._menu_items[SUSPEND_NOW] = Button(SUSPEND_NOW, callback=self.suspend)
+
         self._menu_items[EXIT] = Button(EXIT, callback=self._update_state, args=(True,))
 
         self._tray = TrayManager("Sleeper Service", run_in_separate_thread=True)
