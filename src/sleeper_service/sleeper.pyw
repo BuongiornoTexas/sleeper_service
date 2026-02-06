@@ -3,7 +3,7 @@
 # settings to avoid setting off unsafe ctypes warning.
 # cspell:ignore pywintypes, typeshed, superceded, WINFUNCTYPE, powrprof, LASTINPUTINFO
 # cspell:ignore dotenv, _MEIPASS, SYSTEMPOWERSTATUS, STANDBYIDLE, HIBERNATEIDLE
-# cspell:ignore Wavelink, Elgato, Segoeui, creationflags
+# cspell:ignore Wavelink, Elgato, Segoeui, creationflags, winrt
 """Implements a simple suspend (sleep/hibernate) forcing mechanic for Windows.
 
 Functions
@@ -35,6 +35,15 @@ from tomli_w import dump as dump_toml
 import win32api
 import win32security
 
+# Note: I'm using the .get() methods of IAsyncOperation to avoid running an asyncio
+# event loop within threads. This seems sensible as I'm only calling the awaitables
+# infrequently, and because of the way I'm using them, blocking is a non-issue.
+from winrt.windows.media.control import (
+    GlobalSystemMediaTransportControlsSessionManager as MediaManager,
+    GlobalSystemMediaTransportControlsSession as Session,
+    GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
+)
+
 M_TO_SECONDS = 60
 # Per https://github.com/pydantic/pydantic-settings/issues/259, use a global
 # hack to allow cli config file location.
@@ -47,7 +56,8 @@ DISABLED = "Disabled"
 USE_SYSTEM_TIMERS = "Use System Timers"
 SUSPEND_STATE = "Suspend state"
 SUSPEND_AFTER = "Suspend after"
-SUSPEND_NOW = "Suspend now!"
+RESUME_PLAYBACK = "Resume playback"
+SUSPEND_SOON = "Suspend now(-ish)!"
 EXIT = "Exit"
 
 
@@ -71,7 +81,7 @@ class RestartType(StrEnum):
 
     # For now, only supporting a basic subprocess.Popen call.
     POPEN = "Popen"
-####################################################
+    ####################################################
 
 
 class PowerStatus(Enum):
@@ -118,10 +128,14 @@ class Settings(BaseSettings):
     enabled: bool = True
     # When using system settings, sleep/hibernate time is pulled from powercfg
     use_system_timer: bool = True
-    # Manual timer if not using system timer
-    manual_suspend_after: int | float = 10  # minutes
+    # Manual timer if not using system timer. Minimum valid value is 60 seconds.
+    manual_suspend_after: int | float = 600  # seconds
     manual_suspend_state: SuspendState = SuspendState.SLEEP
-    check_interval: int | float = 1  # minutes
+    check_interval: int | float = 60  # seconds
+    # Default state of resume playback button.
+    resume_playback: bool = False
+    # Wait time after resuming from sleep before trying to resume playback (s).
+    resume_playback_delay: int = 1  # Seconds!
     suspend_button: bool = False
     ####################################################
     # BETA Functionality. May remove this in future.
@@ -162,7 +176,12 @@ class Settings(BaseSettings):
         return (TomlConfigSettingsSource(settings_cls, toml_file=CONFIG_FILE_PATH),)
 
     def model_post_init(self, context: Any, /) -> None:
-        """Resave settings."""
+        """Fix unsafe settings and resave."""
+
+        # It's a really bad idea to allow this to be too short!
+        self.manual_suspend_after = max(self.manual_suspend_after, 60)
+        # Anything less than a second is bananas (also a lazy fix for v0.20 update).
+        self.check_interval = max(self.check_interval, 1)
         self.save()
 
     def save(self) -> None:
@@ -229,6 +248,7 @@ class SleeperService:
     _exit_flag: bool = False
     _shared_enabled_state: bool
     _shared_use_system_state: bool
+    _shared_resume_playback: bool
 
     _lock: threading.Lock
     _state_change: threading.Event
@@ -258,13 +278,17 @@ class SleeperService:
         self._settings = settings
 
         # Deal with settings that can only be modified by editing the settings file.
-        self._check_interval = int(self._settings.check_interval * M_TO_SECONDS)
+        self._check_interval = self._settings.check_interval
 
         # Set up thread objects for comms and initialise shared values
         self._lock = threading.Lock()
         self._state_change = threading.Event()
         self._shared_enabled_state = self._settings.enabled
         self._shared_use_system_state = self._settings.use_system_timer
+        self._shared_resume_playback = self._settings.resume_playback
+
+        # Flag for quick suspend.
+        self._quick_suspend = threading.Event()
 
         # And build the system tray.
         self._create_tray()
@@ -291,8 +315,16 @@ class SleeperService:
         )
         self._menu_items[SUSPEND_STATE] = Label(text="      Suspend: disabled")
         self._menu_items[SUSPEND_AFTER] = Label(text="      After: 0s")
+        self._menu_items[RESUME_PLAYBACK] = CheckBox(
+            RESUME_PLAYBACK,
+            check_default=self._shared_resume_playback,
+            checked_callback=self._update_state,
+            unchecked_callback=self._update_state,
+        )
         if self._settings.suspend_button:
-            self._menu_items[SUSPEND_NOW] = Button(SUSPEND_NOW, callback=self.suspend)
+            self._menu_items[SUSPEND_SOON] = Button(
+                SUSPEND_SOON, callback=self._quick_suspend.set
+            )
 
         self._menu_items[EXIT] = Button(EXIT, callback=self._update_state, args=(True,))
 
@@ -330,6 +362,9 @@ class SleeperService:
             self._shared_use_system_state = self._menu_items[
                 USE_SYSTEM_TIMERS
             ].get_status()
+            self._shared_resume_playback = self._menu_items[
+                RESUME_PLAYBACK
+            ].get_status()
 
             if tray_exit:
                 # Could do this in a separate routine, but I prefer to keep all of the
@@ -346,11 +381,9 @@ class SleeperService:
     def _update_suspend_settings(self) -> None:
         """Update service suspend timer and state based on tray settings."""
         if not self._settings.use_system_timer:
-            # In manual mode, we assume the user knows what they are doing. No
+            # In manual mode, we assume the user knows what they are doing. Almost no
             # checks. At all.
-            self._suspend_after = int(
-                self._settings.manual_suspend_after * M_TO_SECONDS
-            )
+            self._suspend_after = int(self._settings.manual_suspend_after)
             self._suspend_state = self._settings.manual_suspend_state
         else:
             # Read system settings.
@@ -574,6 +607,7 @@ class SleeperService:
             with self._lock:
                 self._settings.enabled = self._shared_enabled_state
                 self._settings.use_system_timer = self._shared_use_system_state
+                self._settings.resume_playback = self._shared_resume_playback
                 # Save on the basis things might have changed. Will happen
                 # very infrequently.
                 self._settings.save()
@@ -590,42 +624,100 @@ class SleeperService:
 
         return True
 
+    @staticmethod
+    def _playback_status(manager: MediaManager) -> dict[Session, bool]:
+        """Return dict of playback status for each session."""
+        last_playback_status = {}
+        for session in manager.get_sessions():
+            # Use .get method to convert async to blocking sync
+            # mp = session.try_get_media_properties_async().get()
+            # Could use session id, but why not just hash on
+            # session object?
+            # session.source_app_user_model_id
+            last_playback_status[session] = (
+                session.get_playback_info().playback_status == PlaybackStatus.PLAYING
+            )
+
+        return last_playback_status
+
+    def _restart_playback(self, last_playback_status: dict[Session, bool]) -> None:
+        """Restarts playback on System Media Transport Control players."""
+        sleep(self._settings.resume_playback_delay)
+
+        for session, was_playing in last_playback_status.items():
+            # After resume, some players will have a status of playing even though
+            # playback is paused/suspended/indeterminate state.
+            # So we'll try a brute force pause-then-play to restart play.
+            if was_playing:
+                session.try_pause_async().get()
+                # Small wrinkle - even with the force pause play, player states may
+                # not catch up as quickly as they should, and if the player
+                # receives a play commend when it thinks it is already playing, it
+                # will ignore it. So we create an ugly event loop to wait until the
+                # pause is confirmed before restarting playback.
+                # (All of this might be alleviated by using asyncio, but a) I don't
+                # want to learn it now and b) if feels like a sledgehammer/nut
+                # solution).
+                # If we don't get there after 5 seconds, probably not going to happen.
+                # As we don't want to end up blocking, try the play command and
+                # move on to the next app.
+                counter = 0
+                while (
+                    session.get_playback_info().playback_status != PlaybackStatus.PAUSED
+                    and counter < 50
+                ):
+                    sleep(0.1)
+                    counter += 1
+                session.try_play_async().get()
+
     def main_loop(self) -> None:
         """Execute main loop for class."""
         # This is the main loop that should be run as separate thread?
 
+        # Create session manager for playback resume.
+        # Use .get method to convert async to blocking sync
+        manager = MediaManager.request_async().get()
+
         while self._check_state():
             sleep(self._check_interval)
+            idle = self.idle_time()
             if (
                 self._settings.enabled
                 and not self._suspend_state == SuspendState.DISABLED
-            ):
-                # Perform idle checks when the service is enabled and we have an
-                # active suspend state. Otherwise keep going.
-                idle = self.idle_time()
-                if idle > self._suspend_after:
-                    # If suspend fails, we'll just try again next cycle.
-                    self.suspend()
+                and idle > self._suspend_after
+            ) or self._quick_suspend.is_set():
+                # Belt and braces.
+                self._quick_suspend.clear()
 
-                    ####################################################
-                    # BETA Functionality. May remove this in future.
-                    # This is where we need to do things like restart programs/apps
-                    # after resuming from suspend. E.g.
-                    # subprocess.Popen("Elgato.Wavelink.exe")
-                    # If I go down this path, need to add a list of processes to
-                    # settings and canned actions that will be applied to these.
-                    # E.g.
-                    # [resume]
-                    # "Elgato.Wavelink.exe", "Popen"
-                    # "Process 2", "Run"
-                    # Do a look up here to decide how to handle each of these wake up
-                    # calls.
-                    # Not trying to be clever at all initially. Restart wavelink and
-                    # call it a day.
-                    for program, restart in self._settings.restarts.items():
-                        if restart == RestartType.POPEN:
-                            Popen(program)
-                    ##############################################################
+                if self._settings.resume_playback:
+                    # Get media player states.
+                    playback_status = self._playback_status(manager)
+
+                # If suspend fails, we'll just try again next cycle.
+                self.suspend()
+
+                if self._settings.resume_playback:
+                    self._restart_playback(playback_status)
+
+                ####################################################
+                # BETA Functionality. May remove this in future.
+                # This is where we need to do things like restart programs/apps
+                # after resuming from suspend. E.g.
+                # subprocess.Popen("Elgato.Wavelink.exe")
+                # If I go down this path, need to add a list of processes to
+                # settings and canned actions that will be applied to these.
+                # E.g.
+                # [resume]
+                # "Elgato.Wavelink.exe", "Popen"
+                # "Process 2", "Run"
+                # Do a look up here to decide how to handle each of these wake up
+                # calls.
+                # Not trying to be clever at all initially. Restart wavelink and
+                # call it a day.
+                for program, restart in self._settings.restarts.items():
+                    if restart == RestartType.POPEN:
+                        Popen(program)
+                ##############################################################
 
 
 if __name__ == "__main__":
