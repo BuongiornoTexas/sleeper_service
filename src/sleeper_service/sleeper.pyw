@@ -25,6 +25,7 @@ from pydantic_settings import (
     PydanticBaseSettingsSource,
     TomlConfigSettingsSource,
 )
+from psutil import process_iter, Process
 from tray_manager import (  # type: ignore[import-untyped]
     TrayManager,
     Button,
@@ -177,7 +178,6 @@ class Settings(BaseSettings):
 
     def model_post_init(self, context: Any, /) -> None:
         """Fix unsafe settings and resave."""
-
         # It's a really bad idea to allow this to be too short!
         self.manual_suspend_after = max(self.manual_suspend_after, 60)
         # Anything less than a second is bananas (also a lazy fix for v0.20 update).
@@ -278,7 +278,7 @@ class SleeperService:
         self._settings = settings
 
         # Deal with settings that can only be modified by editing the settings file.
-        self._check_interval = self._settings.check_interval
+        self._check_interval = int(self._settings.check_interval)
 
         # Set up thread objects for comms and initialise shared values
         self._lock = threading.Lock()
@@ -720,7 +720,46 @@ class SleeperService:
                 ##############################################################
 
 
+def single_instance() -> bool:
+    """Check if another instance of the command line is running."""
+    retval = True
+
+    # Check this instance against others.
+    this = Process()
+    this_pid = this.pid
+    parent = this.parent()
+    if parent:
+        this_parent = parent.pid
+    else:
+        this_parent = -1
+
+    this_name = this.name()
+    this_cmdline = this.cmdline()
+
+    processes = {
+        p.pid: p.info
+        for p in process_iter(["name", "cmdline"])
+        if p.info['name'] == this_name
+    }
+
+    for pid, info in processes.items():
+        if pid != this_pid:
+            if info['cmdline'] == this_cmdline and this_parent != pid:
+                # annoyingly, depending on how the python launcher is invoked, we
+                # can end up with two processes with identical command lines, so ignore
+                # parent of this process.
+                # Unlikely to work properly when debugging, but I figure anyone doing
+                # dev is old enough and ugly enough manage this.
+                retval = False
+                break
+
+    return retval
+
+
 if __name__ == "__main__":
+    if not single_instance():
+        sys.exit()
+
     parser = ArgumentParser(
         description="Simple suspend service to force hibernate/sleep after a set time."
     )
