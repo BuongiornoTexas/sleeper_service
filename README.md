@@ -85,6 +85,7 @@ make it a higher priority.
 
 # Change Log
 
+- **v0.20.1** Minor changes that (hopefully) eliminate double sleep events.
 - **v0.20.0** Added an option to restart media playback on resume from suspend. This is
 useful for media streams that pause after losing internet connectivity (e.g. Deezer,
 youtube).

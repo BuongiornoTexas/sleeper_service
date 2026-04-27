@@ -670,6 +670,14 @@ class SleeperService:
                     counter += 1
                 session.try_play_async().get()
 
+    def _suspend_pending(self) -> bool:
+        """Return true when idle time exceeds suspend time or quick suspend is set."""
+        return (
+            self._settings.enabled
+            and not self._suspend_state == SuspendState.DISABLED
+            and self.idle_time() > self._suspend_after
+        ) or self._quick_suspend.is_set()
+
     def main_loop(self) -> None:
         """Execute main loop for class."""
         # This is the main loop that should be run as separate thread?
@@ -680,44 +688,50 @@ class SleeperService:
 
         while self._check_state():
             sleep(self._check_interval)
-            idle = self.idle_time()
-            if (
-                self._settings.enabled
-                and not self._suspend_state == SuspendState.DISABLED
-                and idle > self._suspend_after
-            ) or self._quick_suspend.is_set():
-                # Belt and braces.
-                self._quick_suspend.clear()
-
+            if self._suspend_pending():
                 if self._settings.resume_playback:
                     # Get media player states.
                     playback_status = self._playback_status(manager)
 
-                # If suspend fails, we'll just try again next cycle.
-                self.suspend()
+                if self._suspend_pending():
+                    # As getting the playback status can take a bit of time,
+                    # do a second check that to ensure we are still waiting on a
+                    # suspend. This (hopefully mostly) deals with the problem that when
+                    # both sleeper_service and system sleep are active, we can get
+                    # system and sleeper_service triggering one after the other.
+                    # If suspend fails, we'll just try again next cycle.
+                    self.suspend()
 
-                if self._settings.resume_playback:
-                    self._restart_playback(playback_status)
+                    # Reinstate playback
+                    if self._settings.resume_playback:
+                        self._restart_playback(playback_status)
 
-                ####################################################
-                # BETA Functionality. May remove this in future.
-                # This is where we need to do things like restart programs/apps
-                # after resuming from suspend. E.g.
-                # subprocess.Popen("Elgato.Wavelink.exe")
-                # If I go down this path, need to add a list of processes to
-                # settings and canned actions that will be applied to these.
-                # E.g.
-                # [resume]
-                # "Elgato.Wavelink.exe", "Popen"
-                # "Process 2", "Run"
-                # Do a look up here to decide how to handle each of these wake up
-                # calls.
-                # Not trying to be clever at all initially. Restart wavelink and
-                # call it a day.
-                for program, restart in self._settings.restarts.items():
-                    if restart == RestartType.POPEN:
-                        Popen(program)
-                ##############################################################
+                    ####################################################
+                    # BETA Functionality. May remove this in future.
+                    # This is where we need to do things like restart programs/apps
+                    # after resuming from suspend. E.g.
+                    # subprocess.Popen("Elgato.Wavelink.exe")
+                    # If I go down this path, need to add a list of processes to
+                    # settings and canned actions that will be applied to these.
+                    # E.g.
+                    # [resume]
+                    # "Elgato.Wavelink.exe", "Popen"
+                    # "Process 2", "Run"
+                    # Do a look up here to decide how to handle each of these wake up
+                    # calls.
+                    # Not trying to be clever at all initially. Restart wavelink and
+                    # call it a day.
+                    for program, restart in self._settings.restarts.items():
+                        if restart == RestartType.POPEN:
+                            Popen(program)
+                    ##############################################################
+
+                    # Finally, sleep for 1 minute to allow for some user input and
+                    # prevent firing a quick succession second sleep.
+                    sleep(M_TO_SECONDS)
+
+                # Finally, clear the quick suspend in case it was set previously.
+                self._quick_suspend.clear()
 
 
 def single_instance() -> bool:
