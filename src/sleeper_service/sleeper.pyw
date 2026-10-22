@@ -14,7 +14,7 @@ import ctypes
 from ctypes import wintypes
 from enum import StrEnum, Enum
 from pathlib import Path
-from subprocess import run as run_sub, Popen, CREATE_NO_WINDOW
+from subprocess import CalledProcessError, run as run_sub, Popen, CREATE_NO_WINDOW
 import sys
 from time import sleep
 import threading
@@ -58,7 +58,8 @@ USE_SYSTEM_TIMERS = "Use System Timers"
 SUSPEND_STATE = "Suspend state"
 SUSPEND_AFTER = "Suspend after"
 RESUME_PLAYBACK = "Resume playback"
-SUSPEND_SOON = "Suspend now(-ish)!"
+RESPECT_OTHER_WAKELOCKS = "Respect other wakelocks"
+SUSPEND_SOON = "Suspend now!"
 EXIT = "Exit"
 
 
@@ -135,6 +136,22 @@ class Settings(BaseSettings):
     check_interval: int | float = 60  # seconds
     # Default state of resume playback button.
     resume_playback: bool = False
+    # Do not suspend while non-bypassed power requests are active.
+    respect_other_wakelocks: bool = True
+    # Power request types mapped to "<request name> <section>" bypasses.
+    bypasses: dict[str, list[str]] = {
+        "driver": [
+            "BEACN Mic system",
+            "Elgato Virtual Audio system",
+            "Legacy Kernel Caller system",
+            "Razer Audio Mixer system",
+            "SteelSeries Sonar Virtual Audio Device system",
+            "TC-Helicon GoXLR Mini system",
+            "VB-Audio Virtual Cable system",
+            "VB-Audio Voicemeeter VAIO system",
+            "Virtual Audio Cable system",
+        ]
+    }
     # Wait time after resuming from sleep before trying to resume playback (s).
     resume_playback_delay: int = 1  # Seconds!
     suspend_button: bool = False
@@ -249,6 +266,8 @@ class SleeperService:
     _shared_enabled_state: bool
     _shared_use_system_state: bool
     _shared_resume_playback: bool
+    _shared_respect_other_wakelocks: bool
+    _is_elevated: bool
 
     _lock: threading.Lock
     _state_change: threading.Event
@@ -276,6 +295,7 @@ class SleeperService:
 
         # Process the settings.
         self._settings = settings
+        self._is_elevated = ctypes.windll.shell32.IsUserAnAdmin() != 0
 
         # Deal with settings that can only be modified by editing the settings file.
         self._check_interval = int(self._settings.check_interval)
@@ -286,9 +306,11 @@ class SleeperService:
         self._shared_enabled_state = self._settings.enabled
         self._shared_use_system_state = self._settings.use_system_timer
         self._shared_resume_playback = self._settings.resume_playback
+        self._shared_respect_other_wakelocks = self._settings.respect_other_wakelocks
 
         # Flag for quick suspend.
         self._quick_suspend = threading.Event()
+        self._loop_wakeup = threading.Event()
 
         # And build the system tray.
         self._create_tray()
@@ -321,9 +343,21 @@ class SleeperService:
             checked_callback=self._update_state,
             unchecked_callback=self._update_state,
         )
+        respect_other_wakelocks_label = RESPECT_OTHER_WAKELOCKS
+        if not self._is_elevated:
+            respect_other_wakelocks_label += " [Requires Admin Privileges]"
+        respect_other_wakelocks = CheckBox(
+            respect_other_wakelocks_label,
+            check_default=self._shared_respect_other_wakelocks,
+            checked_callback=self._update_state,
+            unchecked_callback=self._update_state,
+        )
+        if not self._is_elevated:
+            respect_other_wakelocks.disable()
+        self._menu_items[RESPECT_OTHER_WAKELOCKS] = respect_other_wakelocks
         if self._settings.suspend_button:
             self._menu_items[SUSPEND_SOON] = Button(
-                SUSPEND_SOON, callback=self._quick_suspend.set
+                SUSPEND_SOON, callback=self._request_quick_suspend
             )
 
         self._menu_items[EXIT] = Button(EXIT, callback=self._update_state, args=(True,))
@@ -351,6 +385,11 @@ class SleeperService:
         else:
             self._tray.set_icon(DISABLED)
 
+    def _request_quick_suspend(self) -> None:
+        """Queue a quick suspend and wake the service loop immediately."""
+        self._quick_suspend.set()
+        self._loop_wakeup.set()
+
     def _update_state(self, tray_exit: bool = False) -> None:
         """Update states and update flag to notify sleeper service of state change."""
         with self._lock:
@@ -365,6 +404,9 @@ class SleeperService:
             self._shared_resume_playback = self._menu_items[
                 RESUME_PLAYBACK
             ].get_status()
+            self._shared_respect_other_wakelocks = self._menu_items[
+                RESPECT_OTHER_WAKELOCKS
+            ].get_status()
 
             if tray_exit:
                 # Could do this in a separate routine, but I prefer to keep all of the
@@ -374,6 +416,7 @@ class SleeperService:
                 # the tray manager loop ends and the tray manager loop is terminated.
                 self._tray.kill()
                 self._exit_flag = True
+                self._loop_wakeup.set()
 
         # Notify sleeper service of state change.
         self._state_change.set()
@@ -608,6 +651,7 @@ class SleeperService:
                 self._settings.enabled = self._shared_enabled_state
                 self._settings.use_system_timer = self._shared_use_system_state
                 self._settings.resume_playback = self._shared_resume_playback
+                self._settings.respect_other_wakelocks = self._shared_respect_other_wakelocks
                 # Save on the basis things might have changed. Will happen
                 # very infrequently.
                 self._settings.save()
@@ -672,11 +716,79 @@ class SleeperService:
 
     def _suspend_pending(self) -> bool:
         """Return true when idle time exceeds suspend time or quick suspend is set."""
-        return (
+        suspend_pending = (
             self._settings.enabled
             and not self._suspend_state == SuspendState.DISABLED
             and self.idle_time() > self._suspend_after
         ) or self._quick_suspend.is_set()
+        return suspend_pending and (
+            not self._settings.respect_other_wakelocks
+            or not self._is_elevated
+            or not self._other_wakelocks_active(self._settings.bypasses)
+        )
+
+    @staticmethod
+    def _other_wakelocks_active(bypasses: dict[str, list[str]]) -> bool:
+        """Return true when powercfg reports requests not listed in the bypasses."""
+        try:
+            output = run_sub(
+                "powercfg /requests",
+                check=True,
+                text=True,
+                capture_output=True,
+                creationflags=CREATE_NO_WINDOW,
+            ).stdout.splitlines()
+        except (OSError, CalledProcessError):
+            return False
+
+        current_section = ""
+        for line in output:
+            entry = line.strip()
+            if entry.endswith(":"):
+                current_section = entry[:-1].strip().casefold()
+            elif (
+                current_section
+                and entry
+                and entry.casefold() != "none."
+            ):
+                if not (entry.startswith("[") and "]" in entry):
+                    continue
+
+                request_type, _, request_name = entry[1:].partition("]")
+                request_type = request_type.strip().casefold()
+                request_name = request_name.strip()
+
+                if not SleeperService._wakelock_is_bypassed(
+                    request_type, request_name, current_section, bypasses
+                ):
+                    return True
+        return False
+
+    @staticmethod
+    def _wakelock_is_bypassed(
+        request_type: str,
+        request_name: str,
+        section: str,
+        bypasses: dict[str, list[str]],
+    ) -> bool:
+        """Return true when a request matches a configured type, name, and section."""
+        for bypass_type, entries in bypasses.items():
+            if bypass_type.casefold() != request_type:
+                continue
+
+            for bypass in entries:
+                bypass_name, separator, bypass_section = bypass.rpartition(" ")
+                if not separator or bypass_section.casefold() != section:
+                    continue
+
+                normalized_name = request_name.casefold()
+                normalized_bypass_name = bypass_name.casefold()
+                if normalized_name == normalized_bypass_name or normalized_name.startswith(
+                    f"{normalized_bypass_name} ("
+                ):
+                    return True
+
+        return False
 
     def main_loop(self) -> None:
         """Execute main loop for class."""
@@ -687,7 +799,8 @@ class SleeperService:
         manager = MediaManager.request_async().get()
 
         while self._check_state():
-            sleep(self._check_interval)
+            self._loop_wakeup.wait(self._check_interval)
+            self._loop_wakeup.clear()
             if self._suspend_pending():
                 if self._settings.resume_playback:
                     # Get media player states.
@@ -726,12 +839,12 @@ class SleeperService:
                             Popen(program)
                     ##############################################################
 
+                    # Clear the quick suspend before the cooldown so new requests are respected.
+                    self._quick_suspend.clear()
+
                     # Finally, sleep for 1 minute to allow for some user input and
                     # prevent firing a quick succession second sleep.
                     sleep(M_TO_SECONDS)
-
-                # Finally, clear the quick suspend in case it was set previously.
-                self._quick_suspend.clear()
 
 
 def single_instance() -> bool:

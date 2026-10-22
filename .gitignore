@@ -145,3 +145,4 @@ tools/set-mode.conf
 
 # vscode
 .vscode/
+src/sleeper_service/config.toml

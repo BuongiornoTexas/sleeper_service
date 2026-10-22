@@ -153,7 +153,7 @@ delay of 15-20 seconds works (irritating, but at least it works).
 If you need to force suspend frequently for testing or other reasons, you can enable
 a `Suspend now(-ish)!` button on the interface by editing the `config.toml` file and
 setting `suspend_button=true` (this option is not available from the UI). When you hit
-the button, the system will suspend at the end of the next `check_interval` (see
+the button, the system will attempt to suspend regardless of most recent user input (see
 [Configuration file](#configuration-file)). 
 
 There are a few other configuration parameters, but these only be changed by editing the
@@ -196,15 +196,34 @@ minute at most).
 - `resume_playback`: `true` or `false`. If true, sleeper service will try to check
 which apps were playing media before suspending and will try to resume playback after
 resuming from suspend. 
+- `respect_other_wakelocks`: `true` or `false`. If true, sleeper service will not
+suspend while `powercfg /requests` reports an active request, except for requests
+listed in `[bypasses]`.
+- `[bypasses]`: Optional lists of ignored power requests for use with `respect_other_wakelocks`, grouped by request type. Each
+entry is the request name followed by its `powercfg /requests` section. Request names
+are case insensitive; the device instance paths in parentheses are
+ignored. The default bypasses include Elgato Virtual Audio, `Legacy Kernel Caller`, SteelSeries
+Sonar, VB-Audio Virtual Cable, VB-Audio VoiceMeeter VAIO, and Virtual Audio
+Cable drivers in the `SYSTEM` section. You can add or remove entries in the config file.
+For example:
+  ```
+  [bypasses]
+  driver = [
+    "Elgato Virtual Audio system",
+    "Legacy Kernel Caller system",
+    "SteelSeries Sonar Virtual Audio Device system",
+    "VB-Audio Virtual Cable system",
+  ]
+  ```
+  Requests in other sections and requests that do not match a bypass still prevent
+  suspension when `respect_other_wakelocks` is enabled.
 - `resume_playback_delay`: How long sleeper service will wait after resuming from
 suspension before trying to restart playback. May be useful for players with long
 buffers that do not resume correctly. See 
 [Installation and Usage](#installation-and-usage).
 - `suspend_button`: when `true`, the tray menu includes a "Suspend now(-ish)!" button
-that will suspend the system at the end of the next `check_interval`. Great for testing!
-Suspend was immediate in **v0.11.0**, but from **v0.20.0** it is included in the event
-loop to ensure it correctly triggers things like resuming media playback. The button is
-not displayed if `false`.
+that will suspend the system immediately, regardless of last user input. Great for testing!
+The button is not displayed if `false`.
 - `[restarts]`: See 
 [Beta: App/program Launch on Resume](#beta-appprogram-launch-on-resume).
 
@@ -216,8 +235,19 @@ manual_suspend_after = 600
 manual_suspend_state = "sleep"
 check_interval = 60
 resume_playback = false
+respect_other_wakelocks = true
 resume_playback_delay = 1
 suspend_button = false
+
+[bypasses]
+driver = [
+    "Elgato Virtual Audio system",
+    "Legacy Kernel Caller system",
+    "SteelSeries Sonar Virtual Audio Device system",
+    "VB-Audio Virtual Cable system",
+    "VB-Audio VoiceMeeter VAIO system",
+    "Virtual Audio Cable system",
+]
 
 [restarts]
 ```
